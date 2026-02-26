@@ -1,0 +1,153 @@
+Resources
+| where type =~ 'microsoft.compute/virtualmachines'
+| extend vmId = id
+// --- Join to extensions FIRST, so expensive fields are only computed for VMs with AMA/MMA ---
+| join kind=inner (
+    Resources
+    | where type =~ 'microsoft.compute/virtualmachines/extensions'
+    | extend vmId = tostring(split(id, '/extensions/')[0])
+    | extend extName = tostring(name)
+    | extend extPublisher = tostring(properties.publisher)
+    | extend AgentType = case(
+        extPublisher =~ 'Microsoft.Azure.Monitor' and extName =~ 'AzureMonitorWindowsAgent', 'AMA',
+        extPublisher =~ 'Microsoft.Azure.Monitor' and extName =~ 'AzureMonitorLinuxAgent', 'AMA',
+        extPublisher =~ 'Microsoft.EnterpriseCloud.Monitoring' and extName =~ 'MicrosoftMonitoringAgent', 'MMA',
+        extPublisher =~ 'Microsoft.EnterpriseCloud.Monitoring' and extName =~ 'OmsAgentForLinux', 'MMA',
+        ''
+    )
+    | where AgentType in ('AMA','MMA')
+    | summarize InstalledAgents = make_set(AgentType) by vmId
+    | extend AgentType = case(
+        array_length(InstalledAgents) == 2, 'AMA+MMA',
+        array_length(InstalledAgents) == 1, tostring(InstalledAgents[0]),
+        'Unknown'
+    )
+    | project vmId, AgentType
+) on vmId
+// --- Now compute OS fields only for VMs that have agents ---
+| extend ivOsName = tostring(properties.extended.instanceView.osName)
+| extend ivOsVersion = tostring(properties.extended.instanceView.osVersion)
+| extend imgPublisher = tostring(properties.storageProfile.imageReference.publisher)
+| extend imgOffer = tostring(properties.storageProfile.imageReference.offer)
+| extend imgSku = tostring(properties.storageProfile.imageReference.sku)
+| extend imgId = tostring(properties.storageProfile.imageReference.id)
+| extend osDiskName = tostring(properties.storageProfile.osDisk.name)
+| extend OSType = tostring(properties.storageProfile.osDisk.osType)
+// Fix #8: SIG fallback — extract image name (penultimate segment), not version (last segment)
+| extend sigImageName = iff(
+    isnotempty(imgId),
+    coalesce(
+        extract(@'/images/([^/]+)/', 1, imgId),
+        extract(@'/images/([^/]+)$', 1, imgId)
+    ),
+    ''
+)
+| extend HasInstanceView = isnotempty(ivOsName)
+| extend osName = case(
+    HasInstanceView, ivOsName,
+    isnotempty(imgOffer), strcat(imgPublisher,'/',imgOffer,'/',imgSku),
+    isnotempty(sigImageName), sigImageName,
+    isnotempty(osDiskName), osDiskName,
+    'Unknown'
+)
+| extend InferredOSVersion = case(
+    HasInstanceView and isnotempty(ivOsVersion), ivOsVersion,
+    // === Marketplace images (publisher/offer/sku) ===
+    // Windows Server: year from SKU (e.g. "2019-Datacenter", "2008-R2-Datacenter")
+    not(HasInstanceView) and imgOffer =~ 'WindowsServer', iff(imgSku has 'R2', strcat(extract(@"^(\d{4})", 1, imgSku), ' R2'), extract(@"^(\d{4})", 1, imgSku)),
+    // Windows Desktop: version from offer (e.g. "Windows-10", "windows-11")
+    not(HasInstanceView) and imgOffer matches regex @"(?i)^Windows-\d+", extract(@"(?i)Windows-(\d+)", 1, imgOffer),
+    // RHEL/CentOS/Oracle Linux: version from SKU (e.g. "7.7", "7-RAW", "82gen2", "94_gen2", "78")
+    not(HasInstanceView) and (imgOffer matches regex @"(?i)^(?:RHEL|CentOS|Oracle-Linux)" or imgPublisher matches regex @"(?i)red.?hat"),
+        case(
+            imgSku matches regex @"^(\d+)[\._](\d+)", strcat(extract(@"^(\d+)", 1, imgSku), ".", extract(@"^(\d+)[\._](\d+)", 2, imgSku)),
+            imgSku matches regex @"^(\d)(\d)", strcat(extract(@"^(\d)", 1, imgSku), ".", extract(@"^\d(\d)", 1, imgSku)),
+            imgSku matches regex @"^(\d+)", extract(@"^(\d+)", 1, imgSku),
+            'unknown'
+        ),
+    // Ubuntu: version from SKU (e.g. "18.04-LTS", "20_04-lts-gen2", "1804")
+    not(HasInstanceView) and imgOffer matches regex @"(?i)ubuntu",
+        case(
+            imgSku matches regex @"(\d{2})[\._](\d{2})", strcat(extract(@"(\d{2})[\._](\d{2})", 1, imgSku), ".", extract(@"(\d{2})[\._](\d{2})", 2, imgSku)),
+            imgSku matches regex @"(\d{2})(\d{2})", strcat(extract(@"(\d{2})(\d{2})", 1, imgSku), ".", extract(@"(\d{2})(\d{2})", 2, imgSku)),
+            'unknown'
+        ),
+    // SUSE/SLES: version from SKU or offer (e.g. SKU "12-sp4", or offer "sles-sap-15-sp1-byos" with SKU "gen1")
+    not(HasInstanceView) and imgOffer matches regex @"(?i)(?:SLES|SUSE)",
+        iff(imgSku matches regex @"^(\d+)", extract(@"^(\d+)", 1, imgSku), extract(@"(?i)(?:sles|suse)\D*?(\d+)", 1, imgOffer)),
+    // === SIG/custom images (sigImageName from gallery image reference) ===
+    // Windows: first 4-digit year after W/WIN (e.g. WIN2008R2 → "2008 R2")
+    not(HasInstanceView) and sigImageName matches regex @"(?i)^(?:W|WIN)(\d{4})", iff(sigImageName matches regex @"(?i)^(?:W|WIN)\d{4}R2", strcat(extract(@"(?i)^(?:W|WIN)(\d{4})", 1, sigImageName), ' R2'), extract(@"(?i)^(?:W|WIN)(\d{4})", 1, sigImageName)),
+    // RHEL/RedHat/CentOS like rhel89, redhat74, centos65 → major.minor
+    not(HasInstanceView) and sigImageName matches regex @"(?i)(?:RHEL|RedHat|CentOS)(\d)(\d)", strcat(extract(@"(?i)(?:RHEL|RedHat|CentOS)(\d)(\d)", 1, sigImageName), ".", extract(@"(?i)(?:RHEL|RedHat|CentOS)(\d)(\d)", 2, sigImageName)),
+    // Oracle Linux like OracleLinux76 → major.minor
+    not(HasInstanceView) and sigImageName matches regex @"(?i)(?:Oracle\s*Linux|OL)(\d)(\d)?", strcat(extract(@"(?i)(?:Oracle\s*Linux|OL)(\d)", 1, sigImageName), iff(isnotempty(extract(@"(?i)(?:Oracle\s*Linux|OL)\d(\d)", 1, sigImageName)), strcat(".", extract(@"(?i)(?:Oracle\s*Linux|OL)\d(\d)", 1, sigImageName)), "")),
+    // Debian like Debian10, Debian9
+    not(HasInstanceView) and sigImageName matches regex @"(?i)Debian(\d+)", extract(@"(?i)Debian(\d+)", 1, sigImageName),
+    // SLES/openSUSE like SLES12, SUSE15
+    not(HasInstanceView) and sigImageName matches regex @"(?i)(?:SLES|SUSE|openSUSE)[\-]?(\d+)", extract(@"(?i)(?:SLES|SUSE|openSUSE)[\-]?(\d+)", 1, sigImageName),
+    // Ubuntu
+    not(HasInstanceView) and sigImageName matches regex @"(?i)Ubuntu[\-]?(\d{2}\.\d{2})", extract(@"(?i)Ubuntu[\-]?(\d{2}\.\d{2})", 1, sigImageName),
+    // fallback
+    'unknown'
+)
+// Pre-compute major version number once to avoid repeated extract+toint
+| extend InferredOSMajor = toint(extract(@"^(\d+)", 1, InferredOSVersion))
+// Pre-compute Windows Server year from SIG image name or marketplace SKU
+| extend _winYear = coalesce(
+    toint(extract(@"(?i)^(?:W|WIN)(\d{4})", 1, sigImageName)),
+    iff(imgOffer =~ 'WindowsServer', toint(extract(@"^(\d{4})", 1, imgSku)), int(null))
+)
+// Pre-compute Windows Desktop version from marketplace offer (e.g. Windows-10, Windows-11)
+| extend _winDesktopVer = toint(extract(@"(?i)Windows-(\d+)", 1, imgOffer))
+| extend LowTLS = case(
+    // Per Microsoft: https://learn.microsoft.com/en-us/azure/azure-monitor/fundamentals/best-practices-security?tabs=vms-os#recommended-action
+    // ===== InstanceView path (running VMs) =====
+    // Windows
+    HasInstanceView and ivOsName has_any ('Windows XP','Windows Vista','Windows Server 2003'), 'true',
+    HasInstanceView and ivOsName has 'Windows Server 2008' and not(ivOsName has 'R2'), 'true',
+    HasInstanceView and ivOsName has 'Windows', 'false',
+    // CentOS 5
+    HasInstanceView and ivOsName has 'CentOS' and InferredOSMajor > 0 and InferredOSMajor <= 5, 'true',
+    HasInstanceView and ivOsName has 'CentOS' and InferredOSMajor >= 6, 'false',
+    // RHEL 5
+    HasInstanceView and ivOsName has_any ('Red Hat', 'RHEL', 'RedHat') and InferredOSMajor > 0 and InferredOSMajor <= 5, 'true',
+    HasInstanceView and ivOsName has_any ('Red Hat', 'RHEL', 'RedHat') and InferredOSMajor >= 6, 'false',
+    // Ubuntu ≤ 12.xx
+    HasInstanceView and ivOsName has 'Ubuntu' and InferredOSMajor > 0 and InferredOSMajor <= 12, 'true',
+    HasInstanceView and ivOsName has 'Ubuntu' and InferredOSMajor > 12, 'false',
+    // Other identifiable Linux — not in Microsoft's low-TLS list
+    HasInstanceView and ivOsName has_any ('Debian', 'SLES', 'SUSE', 'Oracle', 'Amazon', 'Alpine') and InferredOSMajor > 0, 'false',
+    // Catch-all for running VMs with identifiable OS
+    HasInstanceView and ivOsName matches regex @'.*\d+.*', 'false',
+    // ===== Custom/SIG/Marketplace path (stopped VMs or no instanceView) =====
+    // Windows Server 2003
+    not(HasInstanceView) and _winYear == 2003, 'true',
+    // Windows Server 2008 non-R2 → true; R2 → false
+    not(HasInstanceView) and _winYear == 2008 and not(InferredOSVersion has 'R2'), 'true',
+    not(HasInstanceView) and _winYear == 2008 and InferredOSVersion has 'R2', 'false',
+    // Windows Server 2012+
+    not(HasInstanceView) and _winYear > 2008, 'false',
+    // Windows 7+ client in SIG image names
+    not(HasInstanceView) and sigImageName matches regex @"(?i)^(?:W|WIN)[\-]?\d+\b", 'false',
+    // Windows Desktop marketplace (all versions support TLS 1.2)
+    not(HasInstanceView) and _winDesktopVer > 0, 'false',
+    // Ubuntu ≤ 12.xx
+    not(HasInstanceView) and (sigImageName matches regex @"(?i)Ubuntu" or imgOffer matches regex @"(?i)ubuntu") and InferredOSMajor > 0 and InferredOSMajor <= 12, 'true',
+    not(HasInstanceView) and (sigImageName matches regex @"(?i)Ubuntu" or imgOffer matches regex @"(?i)ubuntu") and InferredOSMajor > 12, 'false',
+    // CentOS 5
+    not(HasInstanceView) and (sigImageName matches regex @"(?i)CentOS" or imgOffer matches regex @"(?i)CentOS") and InferredOSMajor > 0 and InferredOSMajor <= 5, 'true',
+    not(HasInstanceView) and (sigImageName matches regex @"(?i)CentOS" or imgOffer matches regex @"(?i)CentOS") and InferredOSMajor >= 6, 'false',
+    // RHEL 5
+    not(HasInstanceView) and (sigImageName matches regex @"(?i)(?:RHEL|RedHat)" or imgOffer matches regex @"(?i)RHEL" or imgPublisher matches regex @"(?i)red.?hat") and InferredOSMajor > 0 and InferredOSMajor <= 5, 'true',
+    not(HasInstanceView) and (sigImageName matches regex @"(?i)(?:RHEL|RedHat)" or imgOffer matches regex @"(?i)RHEL" or imgPublisher matches regex @"(?i)red.?hat") and InferredOSMajor >= 6, 'false',
+    // Other identifiable OS (Debian, SLES, Oracle, etc.) — not in Microsoft's low-TLS list
+    not(HasInstanceView) and (sigImageName matches regex @"(?i)(?:Debian|SLES|SUSE|openSUSE|Oracle)" or imgOffer matches regex @"(?i)(?:Debian|SLES|SUSE|Oracle)") and InferredOSMajor > 0, 'false',
+    // Safety-net: version was successfully inferred and all low-TLS checks above were negative
+    InferredOSVersion != 'unknown' and InferredOSMajor > 0, 'false',
+    'unknown'
+)
+| summarize VMCount = count(), LowTLS = take_any(LowTLS) by osName, OSType, InferredOSVersion, AgentType
+| extend SortKey = case(LowTLS == 'true', 1, LowTLS == 'unknown', 2, 3)
+| order by SortKey asc, VMCount desc
+| project osName, OSType, InferredOSVersion, AgentType, VMCount, LowTLS

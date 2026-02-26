@@ -1,0 +1,112 @@
+Resources
+| where type =~ 'microsoft.hybridcompute/machines'
+| extend machineId = id
+// --- Join to extensions FIRST, so expensive fields are only computed for machines with AMA/MMA ---
+| join kind=inner (
+    Resources
+    | where type =~ 'microsoft.hybridcompute/machines/extensions'
+    | extend machineId = tostring(split(id, '/extensions/')[0])
+    | extend extName = tostring(name)
+    | extend extPublisher = tostring(properties.publisher)
+    | extend AgentType = case(
+        extPublisher =~ 'Microsoft.Azure.Monitor' and extName =~ 'AzureMonitorWindowsAgent', 'AMA',
+        extPublisher =~ 'Microsoft.Azure.Monitor' and extName =~ 'AzureMonitorLinuxAgent', 'AMA',
+        extPublisher =~ 'Microsoft.EnterpriseCloud.Monitoring' and extName =~ 'MicrosoftMonitoringAgent', 'MMA',
+        extPublisher =~ 'Microsoft.EnterpriseCloud.Monitoring' and extName =~ 'OmsAgentForLinux', 'MMA',
+        ''
+    )
+    | where AgentType in ('AMA','MMA')
+    | summarize InstalledAgents = make_set(AgentType) by machineId
+    | extend AgentType = case(
+        array_length(InstalledAgents) == 2, 'AMA+MMA',
+        array_length(InstalledAgents) == 1, tostring(InstalledAgents[0]),
+        'Unknown'
+    )
+    | project machineId, AgentType
+) on machineId
+// --- Join to ResourceContainers to get subscription display name ---
+| join kind=leftouter (
+    ResourceContainers
+    | where type =~ 'microsoft.resources/subscriptions'
+    | project subscriptionId, subscriptionName = name
+) on subscriptionId
+// --- Extract OS fields from Arc machine properties ---
+| extend OSType = tostring(properties.osType)
+| extend osSku = tostring(properties.osSku)
+| extend osVersion = tostring(properties.osVersion)
+// osName: prefer osSku (descriptive), fall back to osName property
+| extend osName = case(
+    isnotempty(osSku), osSku,
+    isnotempty(tostring(properties.osName)), tostring(properties.osName),
+    'Unknown'
+)
+// --- Infer OS version from osSku ---
+| extend InferredOSVersion = case(
+    // Windows Server: extract year + optional R2 (e.g. "Windows Server 2008 R2 Datacenter" → "2008 R2")
+    osSku matches regex @"(?i)Windows Server (\d{4})", extract(@"(?i)Windows Server (\d{4}(?:\s*R2)?)", 1, osSku),
+    // Windows Desktop: extract version (e.g. "Windows 10 Enterprise" → "10", "Windows 11 Pro" → "11")
+    osSku matches regex @"(?i)^Windows (\d+)\b", extract(@"(?i)^Windows (\d+)", 1, osSku),
+    // Ubuntu: extract version (e.g. "Ubuntu 20.04.3 LTS" → "20.04")
+    osSku matches regex @"(?i)Ubuntu\s+(\d+\.\d+)", extract(@"(?i)Ubuntu\s+(\d+\.\d+)", 1, osSku),
+    // RHEL / Red Hat: extract version (e.g. "Red Hat Enterprise Linux 8.4 (Ootpa)" → "8.4")
+    osSku matches regex @"(?i)(?:Red\s*Hat|RHEL)\D+(\d+\.?\d*)", extract(@"(?i)(?:Red\s*Hat|RHEL)\D+(\d+\.?\d*)", 1, osSku),
+    // CentOS: extract version (e.g. "CentOS Linux 7 (Core)" → "7")
+    osSku matches regex @"(?i)CentOS\D+(\d+\.?\d*)", extract(@"(?i)CentOS\D+(\d+\.?\d*)", 1, osSku),
+    // Oracle Linux: extract version (e.g. "Oracle Linux Server 7.9" → "7.9")
+    osSku matches regex @"(?i)Oracle\D+(\d+\.?\d*)", extract(@"(?i)Oracle\D+(\d+\.?\d*)", 1, osSku),
+    // Debian: extract version (e.g. "Debian GNU/Linux 10 (buster)" → "10")
+    osSku matches regex @"(?i)Debian\D+(\d+)", extract(@"(?i)Debian\D+(\d+)", 1, osSku),
+    // SLES/SUSE: extract version (e.g. "SUSE Linux Enterprise Server 15 SP3" → "15")
+    osSku matches regex @"(?i)(?:SLES|SUSE)\D+(\d+)", extract(@"(?i)(?:SLES|SUSE)\D+(\d+)", 1, osSku),
+    // Amazon Linux: extract version (e.g. "Amazon Linux 2" → "2")
+    osSku matches regex @"(?i)Amazon\s+Linux\D*(\d+)", extract(@"(?i)Amazon\s+Linux\D*(\d+)", 1, osSku),
+    // Alpine Linux: extract version
+    osSku matches regex @"(?i)Alpine\D+(\d+\.?\d*)", extract(@"(?i)Alpine\D+(\d+\.?\d*)", 1, osSku),
+    // --- Fallback: when osSku is empty, try extracting version from osName (= properties.osName) ---
+    isempty(osSku) and osName matches regex @"(?i)(?:Red\s*Hat|RHEL)\D+(\d+\.?\d*)", extract(@"(?i)(?:Red\s*Hat|RHEL)\D+(\d+\.?\d*)", 1, osName),
+    isempty(osSku) and osName matches regex @"(?i)CentOS\D+(\d+\.?\d*)", extract(@"(?i)CentOS\D+(\d+\.?\d*)", 1, osName),
+    isempty(osSku) and osName matches regex @"(?i)Ubuntu\s+(\d+\.\d+)", extract(@"(?i)Ubuntu\s+(\d+\.\d+)", 1, osName),
+    isempty(osSku) and osName matches regex @"(?i)Debian\D+(\d+)", extract(@"(?i)Debian\D+(\d+)", 1, osName),
+    isempty(osSku) and osName matches regex @"(?i)(?:SLES|SUSE)\D+(\d+)", extract(@"(?i)(?:SLES|SUSE)\D+(\d+)", 1, osName),
+    isempty(osSku) and osName matches regex @"(?i)Oracle\D+(\d+\.?\d*)", extract(@"(?i)Oracle\D+(\d+\.?\d*)", 1, osName),
+    isempty(osSku) and osName matches regex @"(?i)Amazon\s+Linux\D*(\d+)", extract(@"(?i)Amazon\s+Linux\D*(\d+)", 1, osName),
+    isempty(osSku) and osName matches regex @"(?i)Alpine\D+(\d+\.?\d*)", extract(@"(?i)Alpine\D+(\d+\.?\d*)", 1, osName),
+    // Extract RHEL/CentOS major version from kernel "el" tag (e.g. "3.10.0-1160.el7.x86_64" → "7")
+    osVersion matches regex @"\.el(\d+)", extract(@"\.el(\d+)", 1, osVersion),
+    // Fallback: use osVersion (kernel/build) if available
+    isnotempty(osVersion), osVersion,
+    'unknown'
+)
+// Pre-compute major version number
+| extend InferredOSMajor = toint(extract(@"^(\d+)", 1, InferredOSVersion))
+| extend LowTLS = case(
+    // Per Microsoft: https://learn.microsoft.com/en-us/azure/azure-monitor/fundamentals/best-practices-security?tabs=vms-os#recommended-action
+    // ===== Windows =====
+    osName has_any ('Windows XP', 'Windows Vista', 'Windows Server 2003'), 'true',
+    // Windows Server 2008 non-R2 only — R2 supports TLS 1.2
+    osName has 'Windows Server 2008' and not(osName has 'R2'), 'true',
+    // All other identifiable Windows → false (not in Microsoft's low-TLS list)
+    osName has 'Windows Server' and InferredOSMajor >= 2008, 'false',
+    osName matches regex @"(?i)^Windows\s+\d", 'false',
+    // ===== Linux =====
+    // CentOS 5
+    osName has 'CentOS' and InferredOSMajor > 0 and InferredOSMajor <= 5, 'true',
+    osName has 'CentOS' and InferredOSMajor >= 6, 'false',
+    // RHEL 5
+    osName has_any ('Red Hat', 'RHEL', 'RedHat') and InferredOSMajor > 0 and InferredOSMajor <= 5, 'true',
+    osName has_any ('Red Hat', 'RHEL', 'RedHat') and InferredOSMajor >= 6, 'false',
+    // Ubuntu ≤ 12.xx
+    osName has 'Ubuntu' and InferredOSMajor > 0 and InferredOSMajor <= 12, 'true',
+    osName has 'Ubuntu' and InferredOSMajor > 12, 'false',
+    // Other identifiable Linux (Debian, SLES, Oracle, Amazon, Alpine, etc.) — not in Microsoft's low-TLS list
+    osName has_any ('Debian', 'SLES', 'SUSE', 'Oracle', 'Amazon', 'Alpine') and InferredOSMajor > 0, 'false',
+    // Fallback: detect RHEL/CentOS from kernel "el" tag when name doesn't identify the distro
+    osVersion matches regex @"\.el\d" and InferredOSMajor > 0 and InferredOSMajor <= 5, 'true',
+    osVersion matches regex @"\.el\d" and InferredOSMajor >= 6, 'false',
+    // Safety-net: version was successfully inferred and all low-TLS checks above were negative
+    InferredOSVersion != 'unknown' and InferredOSMajor > 0, 'false',
+    'unknown'
+)
+| extend SortKey = case(LowTLS == 'true', 1, LowTLS == 'unknown', 2, 3)
+| order by SortKey asc, osName asc, subscriptionName asc, resourceGroup asc, name asc
+| project subscriptionName, subscriptionId, resourceGroup, machineName = name, osName, OSType, InferredOSVersion, AgentType, LowTLS
