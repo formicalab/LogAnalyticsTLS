@@ -83,8 +83,10 @@ Resources
     // Per Microsoft: https://learn.microsoft.com/en-us/azure/azure-monitor/fundamentals/best-practices-security?tabs=vms-os#recommended-action
     // ===== Windows =====
     osName has_any ('Windows XP', 'Windows Vista', 'Windows Server 2003'), 'true',
-    // Windows Server 2008 non-R2 only — R2 supports TLS 1.2
+    // Windows Server 2008 non-R2 only
     osName has 'Windows Server 2008' and not(osName has 'R2'), 'true',
+    // Windows Server 2008 R2 — TLS 1.2 possible but requires KB3140245 + registry key
+    osName has 'Windows Server 2008' and osName has 'R2', 'registry',
     // All other identifiable Windows → false (not in Microsoft's low-TLS list)
     osName has 'Windows Server' and InferredOSMajor >= 2008, 'false',
     osName matches regex @"(?i)^Windows\s+\d", 'false',
@@ -107,6 +109,6 @@ Resources
     InferredOSVersion != 'unknown' and InferredOSMajor > 0, 'false',
     'unknown'
 )
-| extend SortKey = case(LowTLS == 'true', 1, LowTLS == 'unknown', 2, 3)
+| extend SortKey = case(LowTLS == 'true', 1, LowTLS == 'registry', 2, LowTLS == 'unknown', 3, 4)
 | order by SortKey asc, osName asc, subscriptionName asc, resourceGroup asc, name asc
 | project subscriptionName, subscriptionId, resourceGroup, machineName = name, osName, OSType, InferredOSVersion, AgentType, LowTLS

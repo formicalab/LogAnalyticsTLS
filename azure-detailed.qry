@@ -94,6 +94,9 @@ Resources
     not(HasInstanceView) and sigImageName matches regex @"(?i)(?:SLES|SUSE|openSUSE)[\-]?(\d+)", extract(@"(?i)(?:SLES|SUSE|openSUSE)[\-]?(\d+)", 1, sigImageName),
     // Ubuntu
     not(HasInstanceView) and sigImageName matches regex @"(?i)Ubuntu[\-]?(\d{2}\.\d{2})", extract(@"(?i)Ubuntu[\-]?(\d{2}\.\d{2})", 1, sigImageName),
+    // === OS disk name fallback (no marketplace, no SIG — VM created from raw disk) ===
+    // Windows: extract year from disk name (e.g. "WIN2019-..." → "2019", "WIN2012R2-..." → "2012 R2")
+    not(HasInstanceView) and isempty(sigImageName) and isempty(imgOffer) and osDiskName matches regex @"(?i)\b(?:W|WIN)(\d{4})", iff(osDiskName matches regex @"(?i)\b(?:W|WIN)\d{4}R2", strcat(extract(@"(?i)\b(?:W|WIN)(\d{4})", 1, osDiskName), ' R2'), extract(@"(?i)\b(?:W|WIN)(\d{4})", 1, osDiskName)),
     // fallback
     'unknown'
 )
@@ -102,7 +105,8 @@ Resources
 // Pre-compute Windows Server year from SIG image name or marketplace SKU
 | extend _winYear = coalesce(
     toint(extract(@"(?i)^(?:W|WIN)(\d{4})", 1, sigImageName)),
-    iff(imgOffer =~ 'WindowsServer', toint(extract(@"^(\d{4})", 1, imgSku)), int(null))
+    iff(imgOffer =~ 'WindowsServer', toint(extract(@"^(\d{4})", 1, imgSku)), int(null)),
+    toint(extract(@"(?i)\b(?:W|WIN)(\d{4})", 1, osDiskName))
 )
 // Pre-compute Windows Desktop version from marketplace offer (e.g. Windows-10, Windows-11)
 | extend _winDesktopVer = toint(extract(@"(?i)Windows-(\d+)", 1, imgOffer))
@@ -112,6 +116,8 @@ Resources
     // Windows
     HasInstanceView and ivOsName has_any ('Windows XP','Windows Vista','Windows Server 2003'), 'true',
     HasInstanceView and ivOsName has 'Windows Server 2008' and not(ivOsName has 'R2'), 'true',
+    // Windows Server 2008 R2 — TLS 1.2 possible but requires KB3140245 + registry key
+    HasInstanceView and ivOsName has 'Windows Server 2008' and ivOsName has 'R2', 'registry',
     HasInstanceView and ivOsName has 'Windows', 'false',
     // CentOS 5
     HasInstanceView and ivOsName has 'CentOS' and InferredOSMajor > 0 and InferredOSMajor <= 5, 'true',
@@ -129,9 +135,9 @@ Resources
     // ===== Custom/SIG/Marketplace path (stopped VMs or no instanceView) =====
     // Windows Server 2003
     not(HasInstanceView) and _winYear == 2003, 'true',
-    // Windows Server 2008 non-R2 → true; R2 → false
+    // Windows Server 2008 non-R2 → true; R2 → registry (needs KB3140245 + reg key)
     not(HasInstanceView) and _winYear == 2008 and not(InferredOSVersion has 'R2'), 'true',
-    not(HasInstanceView) and _winYear == 2008 and InferredOSVersion has 'R2', 'false',
+    not(HasInstanceView) and _winYear == 2008 and InferredOSVersion has 'R2', 'registry',
     // Windows Server 2012+
     not(HasInstanceView) and _winYear > 2008, 'false',
     // Windows 7+ client in SIG image names
@@ -153,6 +159,6 @@ Resources
     InferredOSVersion != 'unknown' and InferredOSMajor > 0, 'false',
     'unknown'
 )
-| extend SortKey = case(LowTLS == 'true', 1, LowTLS == 'unknown', 2, 3)
+| extend SortKey = case(LowTLS == 'true', 1, LowTLS == 'registry', 2, LowTLS == 'unknown', 3, 4)
 | order by SortKey asc, osName asc, subscriptionName asc, resourceGroup asc, name asc
 | project subscriptionName, subscriptionId, resourceGroup, vmName = name, osName, OSType, InferredOSVersion, AgentType, LowTLS

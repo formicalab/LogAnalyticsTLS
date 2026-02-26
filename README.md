@@ -20,8 +20,7 @@ Each query produces a `LowTLS` column:
 
 | Value | Meaning |
 |-------|---------|
-| `true` | OS is known to **not support TLS 1.2** natively — requires remediation or decommission |
-| `false` | OS supports TLS 1.2 — no action needed |
+| `true` | OS is known to **not support TLS 1.2** natively — requires remediation or decommission || `registry` | OS can support TLS 1.2 but **requires a hotfix and registry change** (see below) || `false` | OS supports TLS 1.2 — no action needed |
 | `unknown` | OS could not be determined from available metadata |
 
 ### OS versions flagged as `LowTLS = true`
@@ -33,7 +32,13 @@ Per Microsoft's documented criteria:
 - **RHEL**: 5.x and earlier
 - **Ubuntu**: 12.x and earlier
 
-> **Note:** Windows Server 2008 **R2** supports TLS 1.2 natively (disabled by default) and is classified as `false`.
+### OS versions flagged as `LowTLS = registry`
+
+- **Windows Server 2008 R2** — TLS 1.2 is supported but disabled by default. Requires:
+  - Install [KB3140245](https://support.microsoft.com/en-us/topic/update-to-enable-tls-1-1-and-tls-1-2-as-default-secure-protocols-in-winhttp-in-windows-c4bd73d2-31d7-761e-0178-11268bb10392)
+  - Set the `DefaultSecureProtocols` registry key
+
+> **Note:** Results are sorted: `true` → `registry` → `unknown` → `false`.
 
 ## How It Works
 
@@ -44,7 +49,7 @@ OS detection uses multiple data sources in priority order:
 1. **InstanceView** (`properties.extended.instanceView.osName/osVersion`) — available for running VMs
 2. **Marketplace image** (`imageReference.publisher/offer/sku`) — parsed for OS family and version
 3. **Shared Image Gallery** (`imageReference.id`) — image name extracted and pattern-matched
-4. **OS disk name** — last resort fallback (often yields `unknown`)
+4. **OS disk name** — last resort fallback; recognizes `WIN`/`W` + year patterns (e.g. `WIN2019-...`, `W2012R2-...`)
 
 ### Arc machine queries
 
