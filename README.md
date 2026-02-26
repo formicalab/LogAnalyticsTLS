@@ -79,7 +79,3 @@ Results can be exported to CSV for further analysis.
 - **Stopped Azure VMs** without a marketplace or SIG image reference fall back to OS disk name, which typically produces `unknown` results. Start the VM or onboard it to Azure Arc for proper detection.
 - **OpenShift cluster nodes** appear as `unknown` because their OS disk names are cluster hash IDs. These run Red Hat CoreOS which supports TLS 1.2.
 - **MMA was deprecated on August 31, 2024.** VMs still running MMA-only should be migrated to AMA regardless of TLS status.
-
-## License
-
-MIT
